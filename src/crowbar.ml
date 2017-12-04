@@ -161,10 +161,14 @@ let range n = Print (pp_int, Primitive (choose_int n))
 
 exception GenFailed of exn * Printexc.raw_backtrace * unit printer
 
-let rec generate : type a . int -> state -> a gen -> a * unit printer =
-  fun size input gen -> match gen with
+let rec generate : type a b.
+  int -> state -> a gen ->
+  (a * unit printer -> b) ->
+  (exn -> b) ->
+  b =
+  fun size input gen kont ke -> match gen with
   | Const k ->
-     k, fun ppf () -> pp ppf "?"
+     kont (k, fun ppf () -> pp ppf "?")
   | Choose xs ->
      (* FIXME: better distribution? *)
      (* FIXME: choices of size > 255? *)
@@ -176,10 +180,10 @@ let rec generate : type a . int -> state -> a gen -> a * unit printer =
        else
          xs in
      let n = choose_int (List.length gens) input in
-     let v, pv = generate size input (List.nth gens n) in
-     v, fun ppf () -> pp ppf "#%d %a" n pv ()
+     generate size input (List.nth gens n) (fun (v, pv) ->
+       kont (v, fun ppf () -> pp ppf "#%d %a" n pv ())) ke
   | Map ([], k) ->
-     k, fun ppf () -> pp ppf "?"
+     kont (k, fun ppf () -> pp ppf "?")
   | Map (gens, f) ->
      let rec len : type k res . int -> (k, res) gens -> int =
        fun acc xs -> match xs with
@@ -192,75 +196,100 @@ let rec generate : type a . int -> state -> a gen -> a * unit printer =
         always mark our passing, even when we've mapped one value into another,
         so we don't blow the stack. *)
      let size = if n < 2 then size - 1 else (size / n) in
-     let v, pvs = gen_apply size input gens f in
-     begin match v with
-       | Ok v -> v, pvs
-       | Error (e, bt) -> raise (GenFailed (e, bt, pvs))
-     end
+     gen_apply size input gens f (fun (v, pvs) ->
+       begin match v with
+         | Ok v -> kont (v, pvs)
+         | Error (e, bt) -> ke (GenFailed (e, bt, pvs))
+       end) ke
   | Option gen ->
      if read_bool input then
-       let v, pv = generate size input gen in
-       Some v, fun ppf () -> pp ppf "Some (%a)" pv ()
+       generate size input gen (fun (v, pv) ->
+         kont (Some v, fun ppf () -> pp ppf "Some (%a)" pv ())) ke
      else
-       None, fun ppf () -> pp ppf "None"
+       kont (None, fun ppf () -> pp ppf "None")
   | List gen ->
-     let elems = generate_list size input gen in
-     List.map fst elems,
-       fun ppf () -> pp_list (fun ppf (v, pv) -> pv ppf ()) ppf elems
+    generate_list size input gen (fun elems ->
+      kont (List.map fst elems,
+            fun ppf () -> pp_list (fun ppf (v, pv) -> pv ppf ()) ppf elems)) ke
   | List1 gen ->
-     let elems = generate_list1 size input gen in
-     List.map fst elems,
-       fun ppf () -> pp_list (fun ppf (v, pv) -> pv ppf ()) ppf elems
+    generate_list1 size input gen (fun elems ->
+      kont (List.map fst elems,
+            fun ppf () -> pp_list (fun ppf (v, pv) -> pv ppf ()) ppf elems)) ke
   | Join gengen ->
-     let gen, pgen = generate size input gengen in
-     let v, pv = generate size input gen in
-     v, fun ppf () -> pp ppf "@[<hv 1>[%a; %a]@]" pgen () pv ()
+    generate size input gengen (fun (gen, pgen) ->
+      generate size input gen (fun (v, pv) ->
+        kont (v, fun ppf () -> pp ppf "@[<hv 1>[%a; %a]@]" pgen () pv ())
+      ) ke
+    ) ke
   | Primitive gen ->
-     gen input, fun ppf () -> pp ppf "?"
+     kont (gen input, fun ppf () -> pp ppf "?")
   | Print (ppv, gen) ->
-     let v, pv = generate size input gen in
-     v, fun ppf () -> ppv ppf v
+     generate size input gen (fun (v, pv) ->
+      kont (v, fun ppf () -> ppv ppf v)) ke
 
-and generate_list : type a . int -> state -> a gen -> (a * unit printer) list =
-  fun size input gen ->
+and generate_list : type a kret.
+  int -> state -> a gen ->
+  ((a * unit printer) list -> kret) ->
+  (exn -> kret) ->
+  kret
+  =
+  fun size input gen kont ke ->
   if read_bool input then
-    generate_list1 size input gen
+    generate_list1 size input gen kont ke
   else
-    []
+    kont []
 
-and generate_list1 : type a . int -> state -> a gen -> (a * unit printer) list =
-  fun size input gen ->
-  let ans = generate size input gen in
-  ans :: generate_list size input gen
+and generate_list1 : type a kret.
+  int -> state -> a gen ->
+  ((a * unit printer) list -> kret) ->
+  (exn -> kret) ->
+  kret
+  =
+  fun size input gen kont ke ->
+    generate size input gen (fun ans ->
+      generate_list size input gen (fun ansl ->
+        kont (ans :: ansl)
+      ) ke
+    ) ke
 
 and gen_apply :
-    type k res . int -> state ->
+    type k res kres. int -> state ->
        (k, res) gens -> k ->
-       (res, exn * Printexc.raw_backtrace) result * unit printer =
-  fun size state gens f ->
+       ((res, exn * Printexc.raw_backtrace) result * unit printer -> kres) ->
+       (exn -> kres) ->
+       kres
+  =
+  fun size state gens f kont ke ->
   let rec go :
-    type k res . int -> state ->
+    type k res kres. int -> state ->
        (k, res) gens -> k ->
-       (res, exn * Printexc.raw_backtrace) result * unit printer list =
+       ((res, exn * Printexc.raw_backtrace) result * unit printer list -> kres) ->
+       (exn -> kres) ->
+       kres
+    =
       fun size input gens -> match gens with
-      | [] -> fun x -> Ok x, []
-      | g :: gs -> fun f ->
-        let v, pv = generate size input g in
-        let res, pvs =
-          match f v with
-          | exception (BadTest _ as e) -> raise e
-          | exception e ->
-             Error (e, Printexc.get_raw_backtrace ()) , []
-          | fv -> go size input gs fv in
-        res, pv :: pvs in
-  let v, pvs = go size state gens f in
-  let pvs = fun ppf () ->
-    match pvs with
-    | [pv] ->
-       pv ppf ()
-    | pvs ->
-       pp_list (fun ppf pv -> pv ppf ()) ppf pvs in
-  v, pvs
+      | [] -> fun x kont ke -> kont (Ok x, [])
+      | g :: gs -> fun f kont ke ->
+        generate size input g (fun (v, pv) ->
+          begin match f v with
+            | exception (BadTest _ as e) ->
+              fun kont ke -> ke e
+            | exception e ->
+              fun kont ke ->
+                kont (Error (e, Printexc.get_raw_backtrace ()) , [])
+            | fv -> go size input gs fv
+          end (fun (res, pvs) -> kont (res, pv :: pvs)) ke
+        ) ke
+  in
+  go size state gens f (fun (v, pvs) ->
+    let pvs = fun ppf () ->
+      match pvs with
+      | [pv] ->
+        pv ppf ()
+      | pvs ->
+        pp_list (fun ppf pv -> pv ppf ()) ppf pvs in
+    kont (v, pvs)
+  ) ke
 
 type test_result = (unit, unit printer) result
 
@@ -294,12 +323,15 @@ type test_status =
   | TestFail of unit printer * unit printer
 
 let run_once (gens : (_, test_result) gens) f state =
-  match gen_apply 100 state gens f with
-  | Ok (Ok v), pvs -> TestPass pvs
-  | Ok (Error p), pvs -> TestFail (p, pvs)
-  | Error (e, bt), pvs -> TestExn (e, bt, pvs)
-  | exception (BadTest s) -> BadInput s
-  | exception (GenFailed (e, bt, pvs)) -> GenFail (e, bt, pvs)
+  gen_apply 100 state gens f
+    (function
+      | Ok (Ok v), pvs -> TestPass pvs
+      | Ok (Error p), pvs -> TestFail (p, pvs)
+      | Error (e, bt), pvs -> TestExn (e, bt, pvs))
+    (function
+      | (BadTest s) -> BadInput s
+      | (GenFailed (e, bt, pvs)) -> GenFail (e, bt, pvs)
+      | e -> raise e)
 
 let classify_status = function
   | TestPass _ -> `Pass
@@ -430,7 +462,7 @@ let run_all_tests tests =
          let status =
            try run_test ~mode:(`Once state) ~silent:false ~verbose @@
              List.nth tests (choose_int (List.length tests) state)
-           with 
+           with
            BadTest s -> BadInput s
          in
          Unix.close fd;
